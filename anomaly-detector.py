@@ -50,18 +50,12 @@ df_aggregated = df_parsed \
         spark_round(stddev(col("response_time_ms")), 2).alias("latency_stddev") 
     ).fillna(0.0)
 
-# --- ENTERPRISE ALERT RULES ---
+# --- ENTERPRISE ALERT RULES  ---
+
 df_alerts = df_aggregated \
     .withColumn("total_events", col("fail_count") + col("success_count")) \
     .withColumn("failure_rate_pct", spark_round((col("fail_count") / col("total_events")) * 100, 2)) \
-    .withColumn("ANOMALY_ALERT", 
-        when((col("event_type") == "payment") & (col("revenue_at_risk_usd") > 5000), "CRITICAL: Revenue Loss Threshold Exceeded")
-        .when((col("event_type") == "payment") & (col("failure_rate_pct") > 20), "HIGH: Gateway Experiencing Elevated Failure Rates")
-        .when((col("event_type") == "checkout_start") & (col("failure_rate_pct") > 30), "HIGH: Checkout Funnel Disruption")
-        .when((col("event_type") == "add_to_cart") & (col("fail_count") > col("success_count")), "HIGH: Add-To-Cart Functionality Degraded")
-        .when((col("event_type") == "search") & (col("latency_stddev") > (col("avg_latency_ms") * 1.5)), "WARNING: Search API Performance Degradation")
-        .otherwise("NORMAL")
-    )
+    .withColumn("revenue_at_risk_usd", col("revenue_at_risk_usd")) # Passed straight through
 
 # --- DYNAMIC EMAIL DISPATCHER ---
 def send_enterprise_email(row, alert_severity, incident_id):
@@ -115,39 +109,79 @@ def send_enterprise_email(row, alert_severity, incident_id):
         print(f"Failed to send email: {e}")
 
 # --- INCIDENT STATE TRACKER ---
-# Dictionary to remember failing systems across micro-batches
 active_incidents = {}
 
+# --- NEW: ADAPTIVE BASELINE TRACKER ---
+historical_baselines = {}
+HISTORY_WINDOW_SIZE = 10  # Track the last 10 batches (5 minutes of history)
+
 def process_batch(df, batch_id):
-    # 1. SAVE THE DATA PATH (Added this back in)
+    # 1. SAVE THE DATA PATH (HDFS)
     if df.count() > 0:
         df.coalesce(1).write \
           .mode("append") \
           .json(f"hdfs://100.84.105.9:9000/user/waqar/ecommerce_alerts/raw_events/batch_{batch_id}")
 
-    # 2. EVALUATE ALERTS & SEND EMAILS
+    # 2. EVALUATE ADAPTIVE ALERTS
     records = df.collect()
     
     for row in records:
         node = row['Node']
         event = row['Event']
         gateway = row['Gateway']
-        status_message = row['System_Status']
         
-        # Unique identifier for the specific system component
+        # Extract all metrics for Multi-Metric Evaluation
+        current_fail_pct = row['Fail_Pct']
+        rev_at_risk = row['Rev_At_Risk']
+        avg_latency = row['Avg_Lat_ms']
+        latency_stddev = row['Volatility']
+        
         system_key = f"{node}-{event}-{gateway}" 
 
+        # Initialize history list if this system component is new
+        if system_key not in historical_baselines:
+            historical_baselines[system_key] = []
+            
+        history = historical_baselines[system_key]
+        status_message = "NORMAL"
+
+        # --- ADAPTIVE & MULTI-METRIC THRESHOLD LOGIC ---
+        if len(history) >= 3: 
+            moving_avg_failure_rate = sum(history) / len(history)
+            
+            # Metric 1: Adaptive Failure Rate (Applies to ALL events)
+            if current_fail_pct > (moving_avg_failure_rate * 2) and current_fail_pct > 5.0:
+                status_message = f"ADAPTIVE HIGH: {event.upper()} failure rate ({current_fail_pct}%) exceeded norm ({round(moving_avg_failure_rate, 2)}%)"
+            
+            # Metric 2: Absolute Revenue Risk (Applies only to payments)
+            elif event == "payment" and rev_at_risk > 5000:
+                status_message = f"CRITICAL: Revenue Loss Risk (${rev_at_risk}) Exceeded"
+                
+            # Metric 3: Statistical Latency Jitter (Applies only to search)
+            elif event == "search" and latency_stddev > (avg_latency * 1.5):
+                status_message = f"WARNING: Search API Performance Degradation (Volatility: {latency_stddev})"
+        
+        # Update the historical baseline with the current batch
+        history.append(current_fail_pct)
+        if len(history) > HISTORY_WINDOW_SIZE:
+            history.pop(0) 
+
+        # --- INCIDENT NOTIFICATION LOGIC ---
         if status_message != "NORMAL":
-            # New or Ongoing Incident
             if system_key not in active_incidents:
                 new_incident_id = str(uuid.uuid4())[:8].upper()
                 active_incidents[system_key] = new_incident_id
-                send_enterprise_email(row.asDict(), status_message, new_incident_id)
+                
+                row_dict = row.asDict()
+                row_dict['System_Status'] = status_message 
+                send_enterprise_email(row_dict, status_message, new_incident_id)
         else:
-            # System Recovered
             if system_key in active_incidents:
                 resolved_incident_id = active_incidents.pop(system_key)
-                send_enterprise_email(row.asDict(), "RESOLVED: System Operations Restored", resolved_incident_id)
+                row_dict = row.asDict()
+                row_dict['System_Status'] = "RESOLVED"
+                send_enterprise_email(row_dict, "RESOLVED: System Operations Restored", resolved_incident_id)
+
 query_hdfs = df_alerts \
     .select(
         col("window.start").cast("string").alias("Time_Window"), 
@@ -157,13 +191,13 @@ query_hdfs = df_alerts \
         col("revenue_at_risk_usd").alias("Rev_At_Risk"),
         col("failure_rate_pct").alias("Fail_Pct"), 
         col("avg_latency_ms").alias("Avg_Lat_ms"), 
-        col("latency_stddev").alias("Volatility"), 
-        col("ANOMALY_ALERT").alias("System_Status")
+        col("latency_stddev").alias("Volatility")
+        
     ) \
     .writeStream \
     .foreachBatch(process_batch) \
     .outputMode("update") \
-    .option("checkpointLocation", "hdfs://100.84.105.9:9000/user/waqar/ecommerce_alerts/checkpoint_01") \
+    .option("checkpointLocation", "hdfs://100.84.105.9:9000/user/waqar/ecommerce_alerts/checkpoint_v1") \
     .start()
 
 query_hdfs.awaitTermination()
