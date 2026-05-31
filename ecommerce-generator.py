@@ -44,8 +44,7 @@ try:
         status = "success"
         response_time = random.randint(15, 120)
         is_anomaly = False
-        
-        cycle = event_count % 400 
+
 
        # --- 2. PROBABILISTIC INCIDENT WINDOWS ---
         cycle = event_count % 2000 
